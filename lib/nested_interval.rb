@@ -33,26 +33,49 @@ module ActiveRecord::Acts
     module ClassMethods
       # The +options+ hash can include:
       # * <tt>:foreign_key</tt> -- the self-reference foreign key column name (default :parent_id).
-      # * <tt>:scope</tt> -- an array of columns to scope independent trees.
-      # * <tt>:lft_index</tt> -- whether to use (1.0 * lftp / lftq) index (default false).
+      # * <tt>:scope_columns</tt> -- an array of columns to scope independent trees.
+      # * <tt>:lft_index</tt> -- whether to use functional index for lft (default false).
       def acts_as_nested_interval(options = {})
-        belongs_to :parent, :class_name => name, :foreign_key => options[:foreign_key] || :parent_id
-        has_many :children, :class_name => name, :foreign_key => options[:foreign_key] || :parent_id, :dependent => :destroy
-        cattr_accessor :nested_interval_scope
+        cattr_accessor :nested_interval_foreign_key
+        cattr_accessor :nested_interval_scope_columns
         cattr_accessor :nested_interval_lft_index
-        self.nested_interval_scope = options[:scope]
+        self.nested_interval_foreign_key = options[:foreign_key] || :parent_id
+        self.nested_interval_scope_columns = Array(options[:scope_columns])
         self.nested_interval_lft_index = options[:lft_index]
+        belongs_to :parent, :class_name => name, :foreign_key => nested_interval_foreign_key
+        has_many :children, :class_name => name, :foreign_key => nested_interval_foreign_key, :dependent => :destroy
+        named_scope :roots, :conditions => {nested_interval_foreign_key => nil}
+        if columns_hash["rgt"]
+          named_scope :preorder, :order => %(rgt DESC, lftp ASC)
+        elsif columns_hash["rgtp"] && columns_hash["rgtq"]
+          named_scope :preorder, :order => %(1.0 * rgtp / rgtq DESC, lftp ASC)
+        else
+          named_scope :preorder, :order => %(nested_interval_rgt(lftp, lftq) DESC, lftp ASC)
+        end
         class_eval do
           include ActiveRecord::Acts::NestedInterval::InstanceMethods
           alias_method_chain :create, :nested_interval
           alias_method_chain :destroy, :nested_interval
           alias_method_chain :update, :nested_interval
-          class << self
-            public :with_scope
-            def root(options = {})
-              with_scope :find => {:conditions => {:lftp => 0, :lftq => 1}} do
-                find :first, options
-              end
+          if columns_hash["lft"]
+            def descendants
+              quoted_table_name = self.class.quoted_table_name
+              nested_interval_scope.scoped :conditions => %(#{lftp} < #{quoted_table_name}.lftp AND #{quoted_table_name}.lft BETWEEN #{1.0 * lftp / lftq} AND #{1.0 * rgtp / rgtq})
+            end
+          elsif nested_interval_lft_index
+            def descendants
+              quoted_table_name = self.class.quoted_table_name
+              nested_interval_scope.scoped :conditions => %(#{lftp} < #{quoted_table_name}.lftp AND 1.0 * #{quoted_table_name}.lftp / #{quoted_table_name}.lftq BETWEEN #{1.0 * lftp / lftq} AND #{1.0 * rgtp / rgtq})
+            end
+          elsif connection.adapter_name == "MySQL"
+            def descendants
+              quoted_table_name = self.class.quoted_table_name
+              nested_interval_scope.scoped :conditions => %((#{quoted_table_name}.lftp != #{rgtp} OR #{quoted_table_name}.lftq != #{rgtq}) AND #{quoted_table_name}.lftp BETWEEN 1 + #{quoted_table_name}.lftq * #{lftp} DIV #{lftq} AND #{quoted_table_name}.lftq * #{rgtp} DIV #{rgtq})
+            end
+          else
+            def descendants
+              quoted_table_name = self.class.quoted_table_name
+              nested_interval_scope.scoped :conditions => %((#{quoted_table_name}.lftp != #{rgtp} OR #{quoted_table_name}.lftq != #{rgtq}) AND #{quoted_table_name}.lftp BETWEEN 1 + #{quoted_table_name}.lftq * CAST(#{lftp} AS BIGINT) / #{lftq} AND #{quoted_table_name}.lftq * CAST(#{rgtp} AS BIGINT) / #{rgtq})
             end
           end
         end
@@ -60,12 +83,20 @@ module ActiveRecord::Acts
     end
 
     module InstanceMethods
+      def set_nested_interval(lftp, lftq)
+        self.lftp, self.lftq = lftp, lftq
+        self.rgtp = rgtp if has_attribute?(:rgtp)
+        self.rgtq = rgtq if has_attribute?(:rgtq)
+        self.lft = lft if has_attribute?(:lft)
+        self.rgt = rgt if has_attribute?(:rgt)
+      end
+
       # Creates record.
       def create_with_nested_interval
-        if parent_id.nil?
-          self.lftp, self.lftq = 0, 1
+        if read_attribute(nested_interval_foreign_key).nil?
+          set_nested_interval 0, 1
         else
-          self.lftp, self.lftq = parent.lock!.next_child_lft
+          set_nested_interval *parent.lock!.next_child_lft
         end
         create_without_nested_interval
       end
@@ -76,52 +107,27 @@ module ActiveRecord::Acts
         destroy_without_nested_interval
       end
 
-      def with_nested_interval_scope(&block)
-        if nested_interval_scope
-          conditions = {}
-          Array(nested_interval_scope).each do |column_name|
-            conditions[column_name] = send(column_name)
-          end
-          self.class.with_scope :find => {:conditions => conditions}, &block
-        else
-          block.call
+      def nested_interval_scope
+        conditions = {}
+        nested_interval_scope_columns.each do |column_name|
+          conditions[column_name] = send(column_name)
         end
-      end
-
-      def with_nested_interval_descendants_scope(&block)
-        with_nested_interval_scope do
-          quoted_table_name = self.class.quoted_table_name
-          if nested_interval_lft_index
-            conditions = %(#{lftp} < #{quoted_table_name}.lftp AND 1.0 * #{quoted_table_name}.lftp / #{quoted_table_name}.lftq BETWEEN #{1.0 * lftp / lftq} AND #{1.0 * rgtp / rgtq})
-          elsif connection.adapter_name == "MySQL"
-            conditions = %((#{quoted_table_name}.lftp != #{rgtp} OR #{quoted_table_name}.lftq != #{rgtq}) AND #{quoted_table_name}.lftp BETWEEN 1 + #{quoted_table_name}.lftq * #{lftp} DIV #{lftq} AND #{quoted_table_name}.lftq * #{rgtp} DIV #{rgtq})
-          else
-            conditions = %((#{quoted_table_name}.lftp != #{rgtp} OR #{quoted_table_name}.lftq != #{rgtq}) AND #{quoted_table_name}.lftp BETWEEN 1 + #{quoted_table_name}.lftq * CAST(#{lftp} AS BIGINT) / #{lftq} AND #{quoted_table_name}.lftq * CAST(#{rgtp} AS BIGINT) / #{rgtq})
-          end
-          self.class.with_scope :find => {:conditions => conditions}, &block
-        end
-      end
-
-      # Returns all descendants.
-      def descendants(options = {})
-        with_nested_interval_descendants_scope do
-          self.class.find :all, options
-        end
+        self.class.scoped(:conditions => conditions)
       end
 
       # Updates record, updating descendants if parent association updated,
       # in which case caller should first acquire table lock.
       def update_with_nested_interval
-        if parent_id.nil?
-          self.lftp, self.lftq = 0, 1
+        if read_attribute(nested_interval_foreign_key).nil?
+          set_nested_interval 0, 1
         elsif !parent.updated?
-          db_self = self.class.find id, :lock => true
-          self.parent_id = db_self.parent_id
-          self.lftp, self.lftq = db_self.lftp, db_self.lftq
+          db_self = self.class.find(id, :lock => true)
+          write_attribute(nested_interval_foreign_key, db_self.read_attribute(nested_interval_foreign_key))
+          set_nested_interval db_self.lftp, db_self.lftq
         else
           # No locking in this case -- caller should have acquired table lock.
-          db_self = self.class.find self.id
-          db_parent = self.class.find parent_id
+          db_self = self.class.find(id)
+          db_parent = self.class.find(read_attribute(nested_interval_foreign_key))
           if db_parent.lftp == db_self.lftp && db_parent.lftq == db_self.lftq \
               || db_parent.lftp > db_parent.lftq * db_self.lftp / db_self.lftq \
               && db_parent.lftp <= db_parent.lftq * db_self.rgtp / db_self.rgtq \
@@ -129,46 +135,58 @@ module ActiveRecord::Acts
             errors.add :parent_id, "is descendant"
             raise ActiveRecord::RecordInvalid, self
           end
-          self.lftp, self.lftq = parent.next_child_lft
-          db_self.with_nested_interval_descendants_scope do
-            mysql_tmp = "@" if connection.adapter_name == "MySQL"
-            self.class.update_all %(
-              lftp = #{db_self.lftq * rgtp - db_self.rgtq * lftp} * lftp
-                      + #{db_self.rgtp * lftp - db_self.lftp * rgtp} * lftq,
-              lftq = #{db_self.lftq * rgtq - db_self.rgtq * lftq} * #{mysql_tmp}lftp
-                      + #{db_self.rgtp * lftq - db_self.lftp * rgtq} * lftq
-            ), mysql_tmp && %(@lftp := lftp)
+          set_nested_interval *parent.next_child_lft
+          mysql_tmp = "@" if connection.adapter_name == "MySQL"
+          cpp = db_self.lftq * rgtp - db_self.rgtq * lftp
+          cpq = db_self.rgtp * lftp - db_self.lftp * rgtp
+          cqp = db_self.lftq * rgtq - db_self.rgtq * lftq
+          cqq = db_self.rgtp * lftq - db_self.lftp * rgtq
+          db_descendants = db_self.descendants
+          if has_attribute?(:rgtp) && has_attribute?(:rgtq)
+            db_descendants.update_all %(
+              rgtp = #{cpp} * rgtp + #{cpq} * rgtq,
+              rgtq = #{cqp} * #{mysql_tmp}rgtp + #{cqq} * rgtq
+            ), mysql_tmp && %(@rgtp := rgtp)
+            db_descendants.update_all %(rgt = 1.0 * rgtp / rgtq) if has_attribute?(:rgt)
           end
+          db_descendants.update_all %(
+            lftp = #{cpp} * lftp + #{cpq} * lftq,
+            lftq = #{cqp} * #{mysql_tmp}lftp + #{cqq} * lftq
+          ), mysql_tmp && %(@lftp := lftp)
+          db_descendants.update_all %(lft = 1.0 * lftp / lftq) if has_attribute?(:lft)
         end
         update_without_nested_interval
       end
 
-      # Returns all ancestors.
-      def ancestors(options = {})
+      def ancestors
         sqls = [%(NULL)]
-        lftp, lftq = self.lftp, self.lftq
-        while lftp != 0
-          x = lftp.inverse(lftq)
-          lftp, lftq = (x * lftp - 1) / lftq, x
-          sqls << %(lftq = #{lftq} AND lftp = #{lftp})
+        p, q = lftp, lftq
+        while p != 0
+          x = p.inverse(q)
+          p, q = (x * p - 1) / q, x
+          sqls << %(lftq = #{q} AND lftp = #{p})
         end
-        self.with_nested_interval_scope do
-          self.class.with_scope :find => {:conditions => sqls * %( OR ), :order => %(lftp)} do
-            self.class.find :all, options
-          end
-        end
+        nested_interval_scope.scoped :conditions => sqls * %( OR )
       end
 
       # Returns depth by counting ancestors up to 0 / 1.
       def depth
         n = 0
-        lftp, lftq = self.lftp, self.lftq
-        while lftp != 0
-          x = lftp.inverse(lftq)
-          lftp, lftq = (x * lftp - 1) / lftq, x
+        p, q = lftp, lftq
+        while p != 0
+          x = p.inverse(q)
+          p, q = (x * p - 1) / q, x
           n += 1
         end
         n
+      end
+
+      def lft
+        1.0 * lftp / lftq
+      end
+
+      def rgt
+        1.0 * rgtp / rgtq
       end
 
       # Returns numerator of right end of interval.
@@ -195,15 +213,13 @@ module ActiveRecord::Acts
         end
       end
 
-      # Returns left end of first free child interval.
+      # Returns left end of interval for next child.
       def next_child_lft
-        lftp, lftq = self.lftp + self.rgtp, self.lftq + self.rgtq
-        children.find(:all, :order => %(lftp, lftq)).each do |child|
-          break if lftp != child.lftp
-          lftp += self.lftp
-          lftq += self.lftq
+        if child = children.find(:first, :order => %(lftq DESC))
+          return lftp + child.lftp, lftq + child.lftq
+        else
+          return lftp + rgtp, lftq + rgtq
         end
-        return lftp, lftq
       end
     end
   end
